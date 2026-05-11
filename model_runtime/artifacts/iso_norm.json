@@ -1,0 +1,10 @@
+{
+  "cutoff_p1": -0.5558593355671826,
+  "p_max": -0.3610826334641106,
+  "p_min": -0.6941314023897022,
+  "config": {
+    "n_estimators": 500,
+    "contamination": 0.001,
+    "trained_on_humans": 2140
+  }
+}
