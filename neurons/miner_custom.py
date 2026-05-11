@@ -9,7 +9,9 @@ chunks for offline inspection / future retraining.
 import gzip
 import json
 import os
+import queue
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -19,20 +21,63 @@ import bittensor as bt
 
 # Make our model_runtime/src importable
 _HERE = Path(__file__).resolve().parent
-_MODEL_SRC = _HERE.parent / "model_runtime" / "src"
+_REPO_ROOT = _HERE.parent
+_MODEL_SRC = _REPO_ROOT / "model_runtime" / "src"
 sys.path.insert(0, str(_MODEL_SRC))
 
 from predict import score_chunk as _model_score  # noqa: E402
 
 # Reuse the reference base miner skeleton (BaseMinerNeuron, blacklist, priority, etc.)
-sys.path.insert(0, str(_HERE.parent))
+sys.path.insert(0, str(_REPO_ROOT))
 from neurons.miner import Miner as BaseRefMiner  # noqa: E402
 from poker44.validator.synapse import DetectionSynapse  # noqa: E402
+from poker44.utils.model_manifest import build_local_model_manifest, manifest_digest  # noqa: E402
 
 
 _LIVE_CHUNK_DIR = Path(os.environ.get("MINER_LIVE_CHUNK_DIR", "/home/kln/live_chunks"))
 _LIVE_CHUNK_DIR.mkdir(parents=True, exist_ok=True)
 _MAX_SAVED_PER_HOUR = 30  # cap to avoid disk fill
+
+_PUBLIC_REPO_URL = "https://github.com/l3n4k4/poker44-miner-sn126"
+_TRAINING_DATA_STATEMENT = (
+    "Trained on Poker44 public training-benchmark chunks dated 2026-04-30 to "
+    "2026-05-08. Hybrid model: LightGBM supervised (human-vs-bot) plus "
+    "IsolationForest one-class on humans only. Final risk score per chunk = "
+    "max(lgb, iso_botprob), with per-batch rank-top-15% binarization."
+)
+_DATA_ATTESTATION = (
+    "All training data was obtained exclusively from the public Poker44 "
+    "training-benchmark API. No validator-private hand histories, no "
+    "validator-internal evaluation chunks, and no live evaluation data "
+    "(active-window chunks) were used in model training."
+)
+
+
+def _build_manifest() -> dict:
+    impl_path = _HERE / "miner_custom.py"
+    manifest = build_local_model_manifest(
+        repo_root=_REPO_ROOT,
+        implementation_files=[impl_path],
+        defaults={
+            "open_source": True,
+            "model_name": "p44-hybrid-lgb-iso",
+            "model_version": "0.4-rank-top15",
+            "framework": "lightgbm+sklearn",
+            "license": "MIT",
+            "inference_mode": "remote",
+            "repo_url": _PUBLIC_REPO_URL,
+            "training_data_statement": _TRAINING_DATA_STATEMENT,
+            "training_data_sources": [
+                "https://api.poker44.net/api/v1/benchmark/chunks (sourceDate 2026-04-30 .. 2026-05-08)",
+            ],
+            "private_data_attestation": _DATA_ATTESTATION,
+            "notes": "Hybrid LightGBM + IsolationForest ensemble; rank-top-15% binarization.",
+        },
+    )
+    # New schema also expects `data_attestation` (singular) alongside the
+    # legacy `private_data_attestation`. Helper only emits the legacy name.
+    manifest["data_attestation"] = _DATA_ATTESTATION
+    return manifest
 
 
 class CustomMiner(BaseRefMiner):
@@ -40,60 +85,43 @@ class CustomMiner(BaseRefMiner):
 
     def __init__(self, config=None):
         super().__init__(config=config)
-        # Manifest schema fields: see docs/miner.md "Model Manifest" section.
-        # CRITICAL: field name is `data_attestation` (singular, not `private_data_attestation`).
-        # Without it, complianceStatus stays "unknown" and platform may reject our manifest,
-        # leaving the previous-owner stale manifest in place.
-        self.model_manifest = {
-            "open_source": False,
-            "model_name": "p44-hybrid-lgb-iso",
-            "model_version": "0.4-rank-top15",
-            "framework": "lightgbm+sklearn",
-            "license": "private",
-            "inference_mode": "remote",
-            "training_data_statement": (
-                "Trained on Poker44 public training-benchmark chunks dated "
-                "2026-04-30 to 2026-05-08. Hybrid model: LightGBM supervised "
-                "(human-vs-bot) plus IsolationForest one-class on humans only. "
-                "Final risk score per chunk = max(lgb, iso_botprob), with "
-                "per-batch rank-top-15% binarization."
-            ),
-            "training_data_sources": [
-                "https://api.poker44.net/api/v1/benchmark/chunks (sourceDate 2026-04-30 .. 2026-05-08)"
-            ],
-            "data_attestation": (
-                "All training data was obtained exclusively from the public Poker44 "
-                "training-benchmark API. No validator-private hand histories, no "
-                "validator-internal evaluation chunks, and no live evaluation data "
-                "(active-window chunks) were used in model training."
-            ),
-            "schema_version": "1",
-            "notes": "Hybrid ensemble for robustness against bot drift; private model.",
-        }
+        self.model_manifest = _build_manifest()
+        bt.logging.info(
+            f"manifest model={self.model_manifest.get('model_name')} "
+            f"version={self.model_manifest.get('model_version')} "
+            f"repo={self.model_manifest.get('repo_url')} "
+            f"commit={self.model_manifest.get('repo_commit') or '<unset>'} "
+            f"open_source={self.model_manifest.get('open_source')} "
+            f"digest={manifest_digest(self.model_manifest)[:12]}"
+        )
+
+        # Background chunk-saver — keeps forward() off the I/O critical path.
+        self._save_queue: "queue.Queue[tuple]" = queue.Queue(maxsize=64)
         self._save_count_hour: int = 0
         self._save_count_window_start: float = time.time()
-        bt.logging.info("CustomMiner v0.2 ready — hybrid LGB+IsoForest ensemble")
+        self._save_thread = threading.Thread(
+            target=self._save_loop, name="chunk-saver", daemon=True
+        )
+        self._save_thread.start()
+
+        bt.logging.info("CustomMiner v0.3 ready — hybrid LGB+IsoForest, async chunk save")
 
     @classmethod
     def score_chunk(cls, chunk: List[dict]) -> float:
         return _model_score(chunk)
 
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
-        # Save chunks to disk BEFORE scoring (best-effort, never blocks scoring)
-        try:
-            self._maybe_save_chunks(synapse)
-        except Exception as e:
-            bt.logging.warning(f"chunk save error (non-fatal): {e}")
+        # Enqueue chunks for background save — never blocks scoring.
+        self._enqueue_save(synapse)
 
-        # Score each chunk
         chunks = synapse.chunks or []
         raw_scores = [self.score_chunk(c) for c in chunks]
         n = len(raw_scores)
 
-        # Hard rank-top-K: mark exactly the top TOP_K_PCT% of chunks (by raw score)
-        # as bot. Conservative K keeps FPR under the 10% cliff even when signal is
-        # weak: with K=15%, even random ranking gives FPR ~ 7.5% (below cliff).
-        # Within each tier we still spread scores so AP rank-quality is preserved.
+        # Hard rank-top-K: mark exactly the top TOP_K_PCT% of chunks (by raw
+        # score) as bot. K=15% keeps FPR under the 10% cliff even with weak
+        # signal (random ranking gives FPR ~ 7.5%). Within each tier we
+        # spread scores so AP rank-quality is preserved.
         TOP_K_PCT = 15
         K = max(2, int(n * TOP_K_PCT / 100))
         if n >= 2:
@@ -102,10 +130,8 @@ class CustomMiner(BaseRefMiner):
             breakpoint_rank = n - K
             for r, idx in enumerate(order):
                 if r < breakpoint_rank:
-                    # Bottom (1-K%): map to [0.05, 0.49] preserving rank
                     stretched[idx] = 0.05 + 0.44 * r / max(1, breakpoint_rank - 1)
                 else:
-                    # Top K%: map to [0.51, 0.95] preserving rank
                     stretched[idx] = 0.51 + 0.44 * (r - breakpoint_rank) / max(1, K - 1)
         else:
             stretched = list(raw_scores)
@@ -120,27 +146,40 @@ class CustomMiner(BaseRefMiner):
         )
         return synapse
 
-    def _maybe_save_chunks(self, synapse: DetectionSynapse) -> None:
-        # Reset hour window
-        now = time.time()
-        if now - self._save_count_window_start >= 3600:
-            self._save_count_hour = 0
-            self._save_count_window_start = now
-        if self._save_count_hour >= _MAX_SAVED_PER_HOUR:
-            return
-
+    def _enqueue_save(self, synapse: DetectionSynapse) -> None:
         chunks = synapse.chunks or []
         if not chunks:
             return
-
         hk = "?"
         try:
             if synapse.dendrite is not None:
                 hk = (synapse.dendrite.hotkey or "?")[:12]
         except Exception:
             pass
+        try:
+            self._save_queue.put_nowait((time.time(), hk, chunks))
+        except queue.Full:
+            pass  # drop silently — chunk save is best-effort
 
-        ts = int(now)
+    def _save_loop(self) -> None:
+        while True:
+            try:
+                ts_f, hk, chunks = self._save_queue.get()
+            except Exception:
+                continue
+            try:
+                self._save_chunks_to_disk(ts_f, hk, chunks)
+            except Exception as e:
+                bt.logging.warning(f"chunk save error (non-fatal): {e}")
+
+    def _save_chunks_to_disk(self, ts_f: float, hk: str, chunks: list) -> None:
+        if ts_f - self._save_count_window_start >= 3600:
+            self._save_count_hour = 0
+            self._save_count_window_start = ts_f
+        if self._save_count_hour >= _MAX_SAVED_PER_HOUR:
+            return
+
+        ts = int(ts_f)
         rid = uuid.uuid4().hex[:8]
         outfile = _LIVE_CHUNK_DIR / f"{ts}_{hk}_{rid}.json.gz"
         payload = {
@@ -150,15 +189,12 @@ class CustomMiner(BaseRefMiner):
             "chunk_sizes": [len(c) for c in chunks],
             "chunks": chunks,
         }
-        try:
-            with gzip.open(outfile, "wt") as f:
-                json.dump(payload, f)
-            self._save_count_hour += 1
-            bt.logging.info(
-                f"saved live chunks → {outfile.name} (n={len(chunks)}, sizes_sum={sum(len(c) for c in chunks)})"
-            )
-        except Exception as e:
-            bt.logging.warning(f"failed to write live chunk file: {e}")
+        with gzip.open(outfile, "wt") as f:
+            json.dump(payload, f)
+        self._save_count_hour += 1
+        bt.logging.info(
+            f"saved live chunks → {outfile.name} (n={len(chunks)}, sizes_sum={sum(len(c) for c in chunks)})"
+        )
 
 
 if __name__ == "__main__":
